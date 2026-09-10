@@ -53,9 +53,32 @@ function normalizeFuturesSymbol(input: string | undefined): string {
 const cache = new Map<string, { timestamp: number; data: any }>();
 const CACHE_TTL_MS = 5000; // 5 seconds
 
-async function fetchBinanceWithCache(url: string, retries = 2): Promise<any> {
-  const cached = cache.get(url);
+// Circuit breaker state for Binance IP ban / rate limit
+let bannedUntil: number = 0;
+let lastKnownUsedWeight: number = 0;
+let lastWeightUpdateTimestamp: number = 0;
+
+export function getBinanceBanStatus(): { isBanned: boolean; bannedUntil: number; remainingSeconds: number; usedWeight: number } {
   const now = Date.now();
+  const isBanned = now < bannedUntil;
+  return {
+    isBanned,
+    bannedUntil,
+    remainingSeconds: isBanned ? Math.ceil((bannedUntil - now) / 1000) : 0,
+    usedWeight: lastKnownUsedWeight,
+  };
+}
+
+async function fetchBinanceWithCache(url: string, retries = 2): Promise<any> {
+  // 1) Circuit Breaker: If banned, abort immediately without sending any REST requests
+  const now = Date.now();
+  if (now < bannedUntil) {
+    const remainingSec = Math.ceil((bannedUntil - now) / 1000);
+    console.warn(`[Binance] IP hâlâ banlı, ${remainingSec}s sonra tekrar denenecek. İstek ATLANIYOR: ${url}`);
+    throw new Error('BANNED_COOLDOWN');
+  }
+
+  const cached = cache.get(url);
   if (cached && now - cached.timestamp < CACHE_TTL_MS) {
     return cached.data;
   }
@@ -74,15 +97,55 @@ async function fetchBinanceWithCache(url: string, retries = 2): Promise<any> {
       });
       clearTimeout(timeout);
 
+      // Track Binance 1-minute used weight from response headers
+      const usedWeightHeader = response.headers.get('x-mbx-used-weight-1m');
+      if (usedWeightHeader) {
+        const parsedWeight = parseInt(usedWeightHeader, 10);
+        if (!isNaN(parsedWeight)) {
+          lastKnownUsedWeight = parsedWeight;
+          lastWeightUpdateTimestamp = Date.now();
+          console.log(`[Binance] Kullanılan ağırlık: ${parsedWeight}/1200`);
+        }
+      }
+
+      // Detect HTTP 418 (Teapot / IP Ban) or HTTP 429 (Rate Limit Breached)
+      if (response.status === 418 || response.status === 429) {
+        let errorBody: any = {};
+        try {
+          errorBody = await response.json();
+        } catch (_) {}
+
+        const errorMsg = errorBody?.msg || '';
+        const match = errorMsg.match(/banned until (\d+)/i);
+        if (match) {
+          bannedUntil = parseInt(match[1], 10);
+        } else {
+          // If no specific timestamp in message, back off safely for 60 seconds
+          bannedUntil = Date.now() + 60_000;
+        }
+
+        console.error(
+          `[Binance] BAN tespit edildi (${response.status}: ${errorMsg}). ${new Date(
+            bannedUntil
+          ).toISOString()}'e kadar hiçbir Binance REST isteği yapılmayacak.`
+        );
+        throw new Error(`BANNED_COOLDOWN: ${errorMsg || response.statusText}`);
+      }
+
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Binance API error ${response.status}: ${errorText}`);
       }
 
       const data = await response.json();
-      cache.set(url, { timestamp: now, data });
+      cache.set(url, { timestamp: Date.now(), data });
       return data;
     } catch (err: any) {
+      if (err.message?.includes('BANNED_COOLDOWN')) {
+        // Do not retry if banned
+        throw err;
+      }
+
       if (attempt === retries) {
         // Fallback: If we have previous cached data for this endpoint, serve it safely
         if (cached && cached.data) {
@@ -593,6 +656,42 @@ let isFirstScanAfterBoot = true;
 let lastScanTimestamp = 0;
 let isScanning = false;
 
+// Sliding window cache for persistent bar history across scans
+interface MarketDataSlidingWindow {
+  klines: any[];
+  oiHist: any[];
+  lastUpdated: number;
+}
+const marketDataSlidingWindow = new Map<string, MarketDataSlidingWindow>();
+
+function mergeKlines(existing: any[], incoming: any[], maxBars = 48): any[] {
+  const map = new Map<number, any>();
+  for (const bar of existing) {
+    if (Array.isArray(bar) && bar.length > 0) map.set(Number(bar[0]), bar);
+  }
+  for (const bar of incoming) {
+    if (Array.isArray(bar) && bar.length > 0) map.set(Number(bar[0]), bar);
+  }
+  return Array.from(map.values())
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .slice(-maxBars);
+}
+
+function mergeOiHist(existing: any[], incoming: any[], maxBars = 48): any[] {
+  const map = new Map<number, any>();
+  for (const item of existing) {
+    const ts = Number(item.timestamp);
+    if (!isNaN(ts)) map.set(ts, item);
+  }
+  for (const item of incoming) {
+    const ts = Number(item.timestamp);
+    if (!isNaN(ts)) map.set(ts, item);
+  }
+  return Array.from(map.values())
+    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
+    .slice(-maxBars);
+}
+
 function escapeHtml(text: string): string {
   return String(text || '')
     .replace(/&/g, '&amp;')
@@ -648,6 +747,22 @@ export async function renderAlertCardAsPng(alertData: any): Promise<Buffer> {
  */
 export async function runBackgroundOiScan(): Promise<void> {
   if (isScanning) return;
+
+  const now = Date.now();
+
+  // 1) Circuit Breaker: Ban aktifse Binance REST isteklerini tamamen atla
+  if (now < bannedUntil) {
+    const remainingSec = Math.ceil((bannedUntil - now) / 1000);
+    console.warn(`[Background Scanner] Binance IP banı aktif (${remainingSec}s kaldı). REST taraması ATLANMIŞTIR, arka planda WS likidasyonları çalışıyor.`);
+    return;
+  }
+
+  // 2) Ağırlık Güvenlik Payı: Son bilinen ağırlık 1000/1200 (%80) üzerindeyse bu turu atla
+  if (lastKnownUsedWeight >= 1000 && now - lastWeightUpdateTimestamp < 60_000) {
+    console.warn(`[Background Scanner] Binance ağırlığı güvenlik eşiğini aştı (${lastKnownUsedWeight}/1200 >= 1000). Ban yememek için bu tur atlanıyor.`);
+    return;
+  }
+
   isScanning = true;
 
   try {
@@ -657,16 +772,42 @@ export async function runBackgroundOiScan(): Promise<void> {
       try {
         const symbol = target.symbol;
         const timeframe = target.timeframe;
+        const targetKey = `${symbol}_${timeframe}`;
 
-        const klinesUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${timeframe}&limit=48`;
-        const oiHistUrl = `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=${timeframe}&limit=48`;
+        // Kayan pencere (Sliding Window): Hafızada yeterli bar (>=40) varsa sadece son 3 barı çek
+        const cachedWindow = marketDataSlidingWindow.get(targetKey);
+        const hasSufficientHistory = Boolean(
+          cachedWindow &&
+          cachedWindow.klines.length >= 40 &&
+          cachedWindow.oiHist.length >= 40
+        );
 
-        const [klinesData, oiHistData] = await Promise.all([
+        const fetchLimit = hasSufficientHistory ? 3 : 48;
+        const klinesUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${timeframe}&limit=${fetchLimit}`;
+        const oiHistUrl = `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=${timeframe}&limit=${fetchLimit}`;
+
+        const [incomingKlines, incomingOiHist] = await Promise.all([
           fetchBinanceWithCache(klinesUrl),
           fetchBinanceWithCache(oiHistUrl),
         ]);
 
-        if (!Array.isArray(klinesData) || !Array.isArray(oiHistData)) {
+        if (!Array.isArray(incomingKlines) || !Array.isArray(incomingOiHist)) {
+          continue;
+        }
+
+        // Merge incoming bars with existing sliding window
+        const mergedKlines = mergeKlines(cachedWindow?.klines || [], incomingKlines, 48);
+        const mergedOiHist = mergeOiHist(cachedWindow?.oiHist || [], incomingOiHist, 48);
+
+        marketDataSlidingWindow.set(targetKey, {
+          klines: mergedKlines,
+          oiHist: mergedOiHist,
+          lastUpdated: Date.now(),
+        });
+
+        // Ensure we have enough bars to calculate accurate Z-scores
+        if (mergedKlines.length < 20 || mergedOiHist.length < 20) {
+          console.warn(`[Background Scanner] ${symbol} bar sayısı henüz yetersiz (${mergedKlines.length}/${mergedOiHist.length}), tohumlama devam ediyor.`);
           continue;
         }
 
@@ -684,7 +825,7 @@ export async function runBackgroundOiScan(): Promise<void> {
           timestamp: Date.now(),
         };
 
-        const processedBars = processMarketBars(klinesData, oiHistData);
+        const processedBars = processMarketBars(mergedKlines, mergedOiHist);
         const alerts = detectAlerts(processedBars, symbol, timeframe as any, confirmedLiquidations, 'tr');
 
         for (const alert of alerts) {
@@ -993,6 +1134,7 @@ app.get('/api/alerts/current', (req, res) => {
     alerts: backendCurrentAlerts,
     lastScanTimestamp,
     targets: MONITORED_TARGETS,
+    binanceStatus: getBinanceBanStatus(),
   });
 });
 
@@ -1085,7 +1227,7 @@ async function startServer() {
 
     setInterval(() => {
       runBackgroundOiScan().catch((err) => console.error('[Background Scanner] Loop scan error:', err));
-    }, 30_000);
+    }, 60_000);
   });
 }
 
