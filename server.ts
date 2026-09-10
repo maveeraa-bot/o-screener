@@ -10,7 +10,13 @@ import { renderAlertCardAsPngUniversal } from './server/cardRenderer';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
+const __filename = (() => {
+  try {
+    return fileURLToPath(import.meta.url); // dev modda (tsx, gerçek ESM) çalışır
+  } catch {
+    return require.main?.filename || process.argv[1] || ''; // prod'da (esbuild cjs bundle) çalışır
+  }
+})();
 const __dirname = path.dirname(__filename);
 
 const app = express();
