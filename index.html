@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Open Interest Variation Alerts</title>
+    <meta name="description" content="Real-time crypto futures Open Interest variation and liquidation alert detector with z-score analytics, pattern recognition, and AI market visualizer." />
+    <meta property="og:title" content="Open Interest Variation Alerts" />
+    <meta property="og:description" content="Real-time crypto futures Open Interest variation and liquidation alert detector with z-score analytics, pattern recognition, and AI market visualizer." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // Suppress platform-expected benign Vite HMR websocket logs in AI Studio preview iframe
+      window.addEventListener('unhandledrejection', function(event) {
+        if (event && event.reason) {
+          const msg = event.reason.message || String(event.reason);
+          if (msg.includes('WebSocket') || msg.includes('websocket')) {
+            event.preventDefault();
+          }
+        }
+      });
+      const _origError = console.error;
+      console.error = function(...args) {
+        const firstArg = args[0] ? String(args[0]) : '';
+        if (firstArg.includes('[vite] failed to connect to websocket') || firstArg.includes('WebSocket closed without opened')) {
+          return;
+        }
+        _origError.apply(console, args);
+      };
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-slate-950 text-slate-100 antialiased font-sans">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

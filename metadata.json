@@ -1,0 +1,6 @@
+{
+  "name": "Open Interest Variation Alerts",
+  "description": "Real-time crypto futures Open Interest variation and liquidation alert detector with z-score analytics, pattern recognition, and AI market visualizer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
